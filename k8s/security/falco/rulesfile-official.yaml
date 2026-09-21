@@ -1,0 +1,24 @@
+---
+apiVersion: artifact.falcosecurity.dev/v1alpha1
+kind: Rulesfile
+metadata:
+  name: falco-rules
+  namespace: falco
+  labels:
+    app.kubernetes.io/managed-by: falco-operator
+spec:
+  ociArtifact:
+    image:
+      # `latest` tracks whatever falcosecurity/rules last published -- fine
+      # to start, but re-verify and pin to a digest
+      # (`repository@sha256:...`) for real production use, same tradeoff
+      # noted for every other `:latest`/floating tag in this manifest set.
+      repository: falcosecurity/rules/falco-rules
+      tag: latest
+    registry:
+      name: ghcr.io
+  # Higher value = higher priority (falco-operator's Rulesfile Priority
+  # field, 0-99, default 50 -- verified against the CRD's Go type). Kept at
+  # the default; rulesfile-custom.yaml is set above it so our rules load
+  # with precedence over these bundled ones.
+  priority: 50

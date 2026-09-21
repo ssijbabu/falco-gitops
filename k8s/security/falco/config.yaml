@@ -1,0 +1,35 @@
+---
+apiVersion: artifact.falcosecurity.dev/v1alpha1
+kind: Config
+metadata:
+  name: falco-output
+  namespace: falco
+  labels:
+    app.kubernetes.io/managed-by: falco-operator
+spec:
+  config:
+    json_output: true
+    # stdout only, on purpose: this leaves shipping alerts off-node to
+    # whatever your cluster's standard log pipeline already is (Fluent
+    # Bit/Vector/Promtail node agent -> your log backend), instead of
+    # having Falco itself own an outbound network dependency. Nothing is
+    # silently sent anywhere else by default.
+    stdout_output:
+      enabled: true
+    http_output:
+      enabled: false
+    priority: warning
+    # Rules that don't set an explicit priority above this threshold are
+    # dropped. Lower to "notice"/"info" temporarily while tuning new rules;
+    # this is the main lever for alert (and log) volume.
+
+    # Default `rule_matching: first` stops at the first matching rule per
+    # event. rulesfile-custom.yaml's rules use the same stock
+    # shell_procs/container/sensitive_files macros as several bundled
+    # falco-rules rules, so without `all` here, a bundled rule could
+    # silently shadow ours for the same event (different output template,
+    # missing our allow-list exceptions) depending on load order. Re-test
+    # throughput if you add many more overlapping custom rules -- Falco's
+    # own docs flag `all` as a potential performance cost under heavy load.
+    rule_matching: all
+  priority: 50

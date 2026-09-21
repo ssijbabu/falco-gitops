@@ -1,0 +1,14 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: falco-security-critical
+  labels:
+    app.kubernetes.io/part-of: falco-security-stack
+value: 900000000
+globalDefault: false
+description: >
+  Used by the Falco DaemonSet so the kubelet keeps it running (and the
+  scheduler places it) ahead of ordinary workloads under node pressure.
+  Deliberately below the built-in system-node-critical/system-cluster-critical
+  classes (reserved for kube-system and restricted to that namespace by
+  default admission rules), and above typical application priorities.

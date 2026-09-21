@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: falco-operator
+  labels:
+    app.kubernetes.io/part-of: falco-security-stack
+    # The operator's own Deployment runs fully unprivileged (runAsNonRoot,
+    # all capabilities dropped — see chart/falco-operator/values.yaml
+    # podSecurityContext/securityContext defaults), so it fits under
+    # "restricted" without exceptions. This is separate from the `falco`
+    # namespace (security/falco/namespace.yaml), where the Falco DaemonSet
+    # itself needs a wider PSA profile for host/kernel access.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

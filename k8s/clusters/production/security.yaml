@@ -1,0 +1,27 @@
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: security
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: infrastructure
+  interval: 30m
+  retryInterval: 2m
+  timeout: 5m
+  path: ./k8s/security
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  # No `healthChecks` block here on purpose: kustomize-controller's generic
+  # status-condition polling looks for a condition of type "Ready", but the
+  # Falco CRD reports "Reconciled" and "Available" instead (see
+  # falco-operator's api/instance/v1alpha1/falco_types.go) -- a healthCheck
+  # against it would sit at "InProgress" forever and block anything that
+  # `dependsOn` this Kustomization. Verify rollout instead with:
+  #   flux get kustomizations
+  #   kubectl get falco falco -n falco -o jsonpath='{.status.conditions}'
+  #   kubectl -n falco get pods -o wide

@@ -1,0 +1,38 @@
+---
+apiVersion: instance.falcosecurity.dev/v1alpha1
+kind: Falco
+metadata:
+  name: falco
+  namespace: falco
+  labels:
+    app.kubernetes.io/managed-by: falco-operator
+spec:
+  # DaemonSet + modern_ebpf is the default when spec is empty; spelled out
+  # here so it's an explicit, reviewable choice rather than an implicit one.
+  type: DaemonSet
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  podTemplateSpec:
+    spec:
+      priorityClassName: falco-security-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      # Monitor control-plane nodes too, not just workers -- full coverage
+      # for a production security-monitoring DaemonSet.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          effect: NoSchedule
+      containers:
+        - name: falco
+          tty: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 2Gi

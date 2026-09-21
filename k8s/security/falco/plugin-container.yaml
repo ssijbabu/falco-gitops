@@ -1,0 +1,20 @@
+---
+# Required by the official rules and the custom rules below: without it,
+# %container.* / %k8s.* fields in rule outputs render empty (see
+# https://falco.org/docs -- collectors.containerEngine). This does add an
+# init-container dependency on ghcr.io/falcosecurity/plugins on every pod
+# (re)start -- a deliberate, reviewable tradeoff, not a hidden default.
+apiVersion: artifact.falcosecurity.dev/v1alpha1
+kind: Plugin
+metadata:
+  name: container
+  namespace: falco
+  labels:
+    app.kubernetes.io/managed-by: falco-operator
+spec:
+  ociArtifact:
+    image:
+      repository: falcosecurity/plugins/plugin/container
+      tag: latest
+    registry:
+      name: ghcr.io

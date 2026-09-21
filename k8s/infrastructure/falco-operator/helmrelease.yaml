@@ -1,0 +1,77 @@
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: falco-operator
+  namespace: falco-operator
+spec:
+  interval: 30m
+  releaseName: falco-operator
+  targetNamespace: falco-operator
+  storageNamespace: falco-operator
+  chart:
+    spec:
+      chart: falco-operator
+      # Pinned, not a floating range: the operator is pre-1.0 and its own
+      # semver doesn't promise minor bumps are non-breaking. Bump this
+      # deliberately (check `helm search repo falcosecurity/falco-operator
+      # --versions` / https://github.com/falcosecurity/falco-operator/releases)
+      # rather than letting Flux auto-track a range. Current stable at time
+      # of writing (verified against the live chart index) is 0.3.1
+      # (appVersion 0.4.1).
+      version: "0.3.1"
+      sourceRef:
+        kind: HelmRepository
+        name: falcosecurity
+        namespace: flux-system
+      interval: 1h
+  install:
+    remediation:
+      retries: 3
+    crds: CreateReplace
+  upgrade:
+    remediation:
+      retries: 3
+      remediateLastFailure: true
+    cleanupOnFail: true
+    # Helm does not touch CRDs on upgrade by design (see install.crds vs
+    # this). When bumping `chart.spec.version` across a version that adds
+    # or changes CRD fields, apply the new CRDs manually first:
+    #   helm show crds falcosecurity/falco-operator --version <new-version> | kubectl apply --server-side -f -
+    crds: Skip
+  rollback:
+    recreate: true
+  driftDetection:
+    mode: enabled
+  test:
+    enable: false
+  values:
+    replicaCount: 1
+
+    resources:
+      requests:
+        cpu: 10m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+    # Prevents Flux's own reconciliation labels from being copied onto
+    # resources the operator generates on behalf of Falco/Component/etc.
+    # CRs (the Falco DaemonSet, its ServiceAccount, ...) — those are owned
+    # by the operator's controllers, not by this HelmRelease or the
+    # `security` Kustomization, and letting kustomize-controller's pruning
+    # labels leak onto them can confuse ownership/pruning across the two
+    # controllers.
+    excludedLabels:
+      - kustomize.toolkit.fluxcd.io/*
+      - helm.toolkit.fluxcd.io/*
+
+    # mTLS between the operator's artifact server and each Falco instance's
+    # artifact-operator sidecar is off by default (plain HTTP, matching
+    # upstream default). Turning it on requires cert-manager + trust-manager
+    # installed in-cluster first — add as a separate infrastructure/
+    # component and flip `mtls.enabled: true` (plus `mtls.createIssuer`/
+    # `trustLabel`, see the chart's values.yaml) once that's in place.
+    mtls:
+      enabled: false

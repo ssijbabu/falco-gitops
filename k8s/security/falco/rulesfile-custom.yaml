@@ -1,0 +1,75 @@
+---
+# Ported forward from the previous kustomize-based k8s/base/falco/
+# configmap-rules.yaml. `capture: true`/`capture_duration` were dropped
+# along with it -- that relied on this manifest set's own `capture:` block
+# and the now-removed sysdig pre-capture sidecar for a full pre+post
+# forensic bundle; native Falco forward-only `.scap` capture is still
+# available (Falco's own `capture:` config block) if you want to add it
+# back later without the sysdig dependency, it's just not wired up here.
+apiVersion: artifact.falcosecurity.dev/v1alpha1
+kind: Rulesfile
+metadata:
+  name: falco-rules-custom
+  namespace: falco
+  labels:
+    app.kubernetes.io/managed-by: falco-operator
+spec:
+  inlineRules:
+    - list: allowed_sensitive_file_readers
+      items: [sshd, systemd, agetty, login, su, sudo]
+
+    - list: allowed_outbound_ports
+      items: [80, 443, 53]
+
+    - rule: Custom - Interactive shell spawned in container
+      desc: >
+        An interactive shell was spawned inside a container. Legitimate
+        debugging via `kubectl exec` should be rare and auditable.
+      condition: >
+        spawned_process
+        and container
+        and shell_procs
+        and proc.tty != 0
+      output: >
+        Interactive shell spawned in container
+        (user=%user.name command=%proc.cmdline
+        container=%container.name image=%container.image.repository
+        k8s.ns=%k8s.ns.name k8s.pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [container, shell, mitre_execution, T1059]
+
+    - rule: Custom - Sensitive file read by unexpected process
+      desc: >
+        A sensitive file (credentials, shadow, keys) was opened for reading
+        by a process outside the small set expected to touch it.
+      condition: >
+        open_read
+        and sensitive_files
+        and not proc.name in (allowed_sensitive_file_readers)
+      output: >
+        Sensitive file opened for reading
+        (user=%user.name command=%proc.cmdline file=%fd.name
+        container=%container.name k8s.ns=%k8s.ns.name k8s.pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [filesystem, mitre_credential_access, T1552]
+
+    - rule: Custom - Unexpected outbound connection from container
+      desc: >
+        A container opened an outbound connection on a port outside the
+        small allow-list below. Tune the list to your actual egress ports
+        before enabling this in a noisy environment.
+      condition: >
+        outbound
+        and container
+        and not fd.sport in (allowed_outbound_ports)
+      output: >
+        Unexpected outbound connection
+        (command=%proc.cmdline connection=%fd.name
+        container=%container.name image=%container.image.repository
+        k8s.ns=%k8s.ns.name k8s.pod=%k8s.pod.name)
+      priority: NOTICE
+      tags: [network, mitre_command_and_control, T1071]
+
+  # Higher than falco-rules' 50 (see rulesfile-official.yaml), so these are
+  # not shadowed by bundled rules matching the same underlying condition.
+  priority: 60
