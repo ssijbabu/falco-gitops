@@ -1,0 +1,44 @@
+---
+# Additive to networkpolicy.yaml's default-deny (NetworkPolicies union
+# their allow rules for any pod matched by more than one -- this doesn't
+# replace or loosen the base policy for Falco's own pods, it only widens
+# egress for pods carrying app.kubernetes.io/name: acr-token-refresher).
+#
+# 0.0.0.0/0 on 443, not a narrower namespaceSelector/ipBlock, because this
+# pod needs to reach login.microsoftonline.com, <registry>.azurecr.io, AND
+# the in-cluster Kubernetes API server -- and on managed clusters (AKS
+# included) the API server's real address is frequently outside the pod
+# network's CIDR (a control-plane-managed endpoint), so it can't be
+# reliably scoped tighter than "anywhere on 443" without being cluster- and
+# CNI-specific. Narrow this to your actual egress if your network policy
+# controller supports it (e.g. an ipBlock for your API server's real
+# address plus Azure's published service tags for AzureActiveDirectory/
+# AzureContainerRegistry).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: acr-token-refresher
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: acr-token-refresher
+    app.kubernetes.io/part-of: falco-security-stack
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: acr-token-refresher
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443

@@ -20,11 +20,19 @@ spec:
       repository: falcosecurity/plugins/plugin/container
       tag: latest
     registry:
-      name: registry.example.com
-      # Secret must contain "username" and "password" keys (the latter can
-      # be a token) -- api/common/v1alpha1/types.go's SecretRef doc, not
-      # the kubernetes.io/dockerconfigjson format imagePullSecrets uses.
-      # See k8s/README.md for how to create it (not committed to git).
+      # Assumed to be Azure Container Registry -- must be
+      # "<ACR_NAME>.azurecr.io", matching the ACR_NAME env var in
+      # cronjob-acr-token-refresh.yaml (that CronJob derives this same
+      # hostname by appending ".azurecr.io" to ACR_NAME).
+      name: "<your-acr-name>.azurecr.io"
+      # falco-registry-credentials is kept live by
+      # cronjob-acr-token-refresh.yaml via Azure Workload Identity -- a
+      # username=00000000-0000-0000-0000-000000000000 / password=<ACR
+      # refresh token> pair refreshed hourly, not a static secret. See
+      # k8s/README.md's "Managed identity for the Plugin OCI pull" section
+      # for the one-time Azure-side setup that has to exist before this
+      # works (creating the managed identity, granting AcrPull, federating
+      # it to the acr-token-refresher ServiceAccount).
       auth:
         secretRef:
           name: falco-registry-credentials

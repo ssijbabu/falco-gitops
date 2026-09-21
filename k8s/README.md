@@ -131,21 +131,116 @@ mechanisms:
    `Plugin` CR's own `registry.auth.secretRef`, which — per
    falco-operator's `api/common/v1alpha1` `SecretRef` type — expects a
    plain Secret with `username`/`password` keys, **not** a
-   `dockerconfigjson`:
+   `dockerconfigjson`. This repo keeps that Secret populated automatically
+   via Azure Managed Identity rather than a static token — see the next
+   section — but if you'd rather not stand up Workload Identity, a static
+   Secret works too (falco-operator's registry client doesn't care how the
+   Secret got its values):
 
    ```bash
    kubectl create secret generic falco-registry-credentials \
      -n falco \
+     --type=kubernetes.io/basic-auth \
      --from-literal=username=<user> \
      --from-literal=password=<token>
    ```
 
-Neither is committed to this repo (Flux never sees the values). Create them
-out-of-band per cluster as above, or manage them through Flux with
-[SOPS](https://fluxcd.io/flux/guides/mozilla-sops/) or
-[external-secrets](https://external-secrets.io/) if you want the Secret
-*objects* (not their plaintext) tracked in git too — neither is wired up
-here.
+   If you go the static-token route, remove `secret-registry-credentials.yaml`,
+   `serviceaccount-acr-refresher.yaml`, `cronjob-acr-token-refresh.yaml`,
+   `networkpolicy-acr-refresher.yaml`, and their entries in
+   `security/falco/kustomization.yaml` — otherwise the CronJob will
+   overwrite your manually-set token hourly with a failed-and-retried
+   refresh attempt.
+
+Neither of the two credentials above is committed to this repo in plaintext.
+The image-pull Secret is created out-of-band per cluster (step 1); the
+Plugin auth Secret is either created out-of-band too, or kept live
+in-cluster by the CronJob below — never held in git either way.
+
+## Managed identity for the Plugin OCI pull
+
+`falco-operator`'s own OCI registry client only supports a static
+`username`/`password` `SecretRef` (verified against its
+`internal/pkg/artifact/registry.go` — no Azure/AWS credential SDK in its
+`go.mod`, just `oras-go`). There's no way to hand it a managed identity
+directly. Instead, `security/falco/cronjob-acr-token-refresh.yaml` runs
+hourly under **Azure Workload Identity** and keeps
+`falco-registry-credentials` populated with a live ACR refresh token, using
+only `curl` (no `az` CLI, no `kubectl` binary) against three endpoints:
+
+1. Exchange the pod's federated token for an AAD access token
+   (`login.microsoftonline.com/<tenant>/oauth2/v2.0/token`, scope
+   `https://management.azure.com/.default`).
+2. Exchange that AAD token for an ACR refresh token
+   (`https://<registry>/oauth2/exchange`).
+3. `PATCH` `falco-registry-credentials` with
+   `username: 00000000-0000-0000-0000-000000000000` (ACR's fixed token
+   username) and `password: <the refresh token>`, via the in-cluster API
+   server using the pod's own projected ServiceAccount token. RBAC
+   (`Role`/`RoleBinding` in the same manifest) scopes this to `get`/`patch`
+   on exactly that one named Secret.
+
+The placeholder `Secret/falco-registry-credentials`
+(`secret-registry-credentials.yaml`) carries a
+`kustomize.toolkit.fluxcd.io/ssa: IfNotPresent` annotation — Flux creates
+it once if missing and never reconciles it again, so it doesn't fight the
+CronJob for ownership of the live value on every 30-minute Kustomization
+reconcile.
+
+**One-time Azure-side setup** (subscription-level `az` commands — not
+something this repo can apply; run these yourself before the CronJob will
+actually authenticate):
+
+```bash
+RG=<resource-group>
+ACR=<your-acr-name>
+AKS=<your-aks-cluster-name>
+IDENTITY=falco-acr-refresher
+
+# 1. User-assigned managed identity
+az identity create -g "$RG" -n "$IDENTITY"
+CLIENT_ID=$(az identity show -g "$RG" -n "$IDENTITY" --query clientId -o tsv)
+PRINCIPAL_ID=$(az identity show -g "$RG" -n "$IDENTITY" --query principalId -o tsv)
+
+# 2. AcrPull only -- least privilege, scoped to this one registry
+az role assignment create \
+  --assignee-object-id "$PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role AcrPull \
+  --scope "$(az acr show -n "$ACR" --query id -o tsv)"
+
+# 3. Federate it to the CronJob's ServiceAccount identity. Requires the AKS
+#    cluster to have OIDC issuer + workload identity enabled
+#    (`az aks update -g $RG -n $AKS --enable-oidc-issuer --enable-workload-identity`
+#    if not already).
+az identity federated-credential create \
+  --name "${IDENTITY}-fic" \
+  --identity-name "$IDENTITY" \
+  --resource-group "$RG" \
+  --issuer "$(az aks show -g "$RG" -n "$AKS" --query oidcIssuerProfile.issuerUrl -o tsv)" \
+  --subject system:serviceaccount:falco:acr-token-refresher \
+  --audience api://AzureADTokenExchange
+
+echo "Set this as the client-id annotation in serviceaccount-acr-refresher.yaml:"
+echo "$CLIENT_ID"
+```
+
+Then in this repo: set that client ID in
+`serviceaccount-acr-refresher.yaml`'s
+`azure.workload.identity/client-id` annotation, and `<your-acr-name>` in
+both `cronjob-acr-token-refresh.yaml`'s `ACR_NAME` env var and
+`plugin-container.yaml`'s `registry.name` (they must agree — the CronJob
+derives the registry hostname by appending `.azurecr.io` to `ACR_NAME`).
+
+After the first scheduled run (or trigger one immediately with
+`kubectl create job --from=cronjob/acr-token-refresh acr-token-refresh-manual -n falco`),
+verify with:
+
+```bash
+kubectl -n falco get jobs -l app.kubernetes.io/name=acr-token-refresher
+kubectl -n falco logs -l app.kubernetes.io/name=acr-token-refresher --tail=20
+kubectl -n falco get plugin container -o jsonpath='{.status.conditions}'
+```
 
 ## Known gaps / next steps (not built here — scope was deliberately kept to core Falco)
 

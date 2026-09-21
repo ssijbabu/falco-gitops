@@ -5,6 +5,10 @@ resources:
   - namespace.yaml
   - priorityclass.yaml
   - networkpolicy.yaml
+  - networkpolicy-acr-refresher.yaml
+  - serviceaccount-acr-refresher.yaml
+  - secret-registry-credentials.yaml
+  - cronjob-acr-token-refresh.yaml
   - plugin-container.yaml
   - rulesfile-official.yaml
   - rulesfile-custom.yaml

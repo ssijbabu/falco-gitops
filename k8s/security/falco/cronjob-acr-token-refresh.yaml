@@ -1,0 +1,169 @@
+---
+# Least-privilege RBAC: PATCH exactly one named Secret, nothing else. Not a
+# blanket "manage secrets" grant.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: acr-token-refresher
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: acr-token-refresher
+    app.kubernetes.io/part-of: falco-security-stack
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["falco-registry-credentials"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: acr-token-refresher
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: acr-token-refresher
+    app.kubernetes.io/part-of: falco-security-stack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: acr-token-refresher
+subjects:
+  - kind: ServiceAccount
+    name: acr-token-refresher
+    namespace: falco
+---
+# Mints a fresh ACR refresh token via Azure Workload Identity federation and
+# PATCHes it into falco-registry-credentials, which the Plugin CR
+# (plugin-container.yaml) authenticates with to pull the container plugin
+# OCI artifact. No az CLI, no kubectl binary -- plain curl against Azure's
+# AAD token endpoint, ACR's own OAuth2 exchange endpoint, and the in-cluster
+# Kubernetes API (using this pod's own projected ServiceAccount token),
+# matching this repo's existing preference (see the old azure-blob-upload
+# overlay this replaced) for minimal-dependency images over heavier CLI
+# tooling.
+#
+# Flow, all three verified against Microsoft's own docs before writing this
+# (not guessed):
+#   1. Exchange the workload-identity federated token
+#      ($AZURE_FEDERATED_TOKEN_FILE, injected by the Azure Workload Identity
+#      webhook because this pod carries the azure.workload.identity/use
+#      label) for an AAD access token, scope https://management.azure.com/.default.
+#   2. POST that AAD token to https://$REGISTRY/oauth2/exchange
+#      (grant_type=access_token) for an ACR refresh token.
+#   3. PATCH falco-registry-credentials with
+#      username=00000000-0000-0000-0000-000000000000 (ACR's fixed token
+#      username) and password=<the ACR refresh token>.
+#
+# ACR refresh tokens are valid for a few hours; this runs hourly to stay
+# comfortably ahead of expiry.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: acr-token-refresh
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: acr-token-refresher
+    app.kubernetes.io/part-of: falco-security-stack
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Replace
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: acr-token-refresher
+            # This is the label that actually triggers the Azure Workload
+            # Identity mutating webhook (see the comment in
+            # serviceaccount-acr-refresher.yaml) -- required here, on the
+            # pod template, not just on the ServiceAccount.
+            azure.workload.identity/use: "true"
+        spec:
+          serviceAccountName: acr-token-refresher
+          restartPolicy: Never
+          securityContext:
+            # curlimages/curl already runs as a non-root user (curl_user,
+            # uid 100) by default -- runAsNonRoot just makes that an
+            # enforced guarantee rather than an assumption, without forcing
+            # a specific uid the image wasn't built for.
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: refresh
+              image: curlimages/curl:8.11.0
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: ACR_NAME
+                  # Just the registry name, no ".azurecr.io" suffix -- must
+                  # match plugin-container.yaml's
+                  # ociArtifact.registry.name minus that suffix.
+                  value: "<your-acr-name>"
+                - name: SECRET_NAMESPACE
+                  value: falco
+                - name: SECRET_NAME
+                  value: falco-registry-credentials
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  registry="${ACR_NAME}.azurecr.io"
+                  sa_dir=/var/run/secrets/kubernetes.io/serviceaccount
+
+                  # 1. Federated token -> AAD access token (client_credentials
+                  #    + client_assertion, per Microsoft Entra's documented
+                  #    workload-identity-federation flow).
+                  aad_response=$(curl -sf -X POST \
+                    -H "Content-Type: application/x-www-form-urlencoded" \
+                    --data-urlencode "grant_type=client_credentials" \
+                    --data-urlencode "client_id=${AZURE_CLIENT_ID}" \
+                    --data-urlencode "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+                    --data-urlencode "client_assertion=$(cat "${AZURE_FEDERATED_TOKEN_FILE}")" \
+                    --data-urlencode "scope=https://management.azure.com/.default" \
+                    "${AZURE_AUTHORITY_HOST}${AZURE_TENANT_ID}/oauth2/v2.0/token")
+                  aad_token=$(printf '%s' "$aad_response" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+                  if [ -z "$aad_token" ]; then
+                    echo "failed to obtain AAD access token: $aad_response" >&2
+                    exit 1
+                  fi
+
+                  # 2. AAD access token -> ACR refresh token (ACR's own
+                  #    OAuth2 exchange endpoint).
+                  acr_response=$(curl -sf -X POST \
+                    -H "Content-Type: application/x-www-form-urlencoded" \
+                    --data-urlencode "grant_type=access_token" \
+                    --data-urlencode "service=${registry}" \
+                    --data-urlencode "access_token=${aad_token}" \
+                    "https://${registry}/oauth2/exchange")
+                  acr_refresh_token=$(printf '%s' "$acr_response" | grep -o '"refresh_token":"[^"]*"' | cut -d'"' -f4)
+                  if [ -z "$acr_refresh_token" ]; then
+                    echo "failed to obtain ACR refresh token: $acr_response" >&2
+                    exit 1
+                  fi
+
+                  # 3. PATCH the target Secret via the in-cluster API
+                  #    server, using this pod's own projected ServiceAccount
+                  #    token (RBAC: Role/acr-token-refresher above, scoped
+                  #    to this one named Secret).
+                  username_b64=$(printf '%s' "00000000-0000-0000-0000-000000000000" | base64 | tr -d '\n')
+                  password_b64=$(printf '%s' "$acr_refresh_token" | base64 | tr -d '\n')
+                  k8s_token=$(cat "${sa_dir}/token")
+
+                  curl -sf -X PATCH \
+                    --cacert "${sa_dir}/ca.crt" \
+                    -H "Authorization: Bearer ${k8s_token}" \
+                    -H "Content-Type: application/strategic-merge-patch+json" \
+                    -d "{\"data\":{\"username\":\"${username_b64}\",\"password\":\"${password_b64}\"}}" \
+                    "https://kubernetes.default.svc/api/v1/namespaces/${SECRET_NAMESPACE}/secrets/${SECRET_NAME}" \
+                    > /dev/null
+
+                  echo "refreshed ${SECRET_NAME} in ${SECRET_NAMESPACE}"
