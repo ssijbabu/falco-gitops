@@ -1,9 +1,12 @@
 ---
 # Required by the official rules and the custom rules below: without it,
 # %container.* / %k8s.* fields in rule outputs render empty (see
-# https://falco.org/docs -- collectors.containerEngine). This does add an
-# init-container dependency on ghcr.io/falcosecurity/plugins on every pod
-# (re)start -- a deliberate, reviewable tradeoff, not a hidden default.
+# https://falco.org/docs -- collectors.containerEngine). Pulled from a
+# private registry mirror rather than ghcr.io directly, via the same
+# artifact-operator sidecar mechanism the Falco pod already uses for rules
+# (see security/falco/networkpolicy.yaml's egress comment) -- so this is
+# still an in-cluster-only pull from the sidecar's perspective, it's the
+# operator's central artifact fetch that goes to the private registry now.
 apiVersion: artifact.falcosecurity.dev/v1alpha1
 kind: Plugin
 metadata:
@@ -17,4 +20,11 @@ spec:
       repository: falcosecurity/plugins/plugin/container
       tag: latest
     registry:
-      name: ghcr.io
+      name: registry.example.com
+      # Secret must contain "username" and "password" keys (the latter can
+      # be a token) -- api/common/v1alpha1/types.go's SecretRef doc, not
+      # the kubernetes.io/dockerconfigjson format imagePullSecrets uses.
+      # See k8s/README.md for how to create it (not committed to git).
+      auth:
+        secretRef:
+          name: falco-registry-credentials

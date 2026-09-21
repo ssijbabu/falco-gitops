@@ -66,14 +66,16 @@ further `kubectl apply` needed.
    `dependsOn` enforces the order):
    - `Falco` CR (`falco.yaml`) — DaemonSet, `modern_ebpf` driver (default),
      hardened scheduling (`PriorityClass`, control-plane tolerations so
-     control-plane nodes are monitored too, pinned resource requests/limits).
+     control-plane nodes are monitored too, pinned resource requests/limits),
+     image pulled from a **private registry mirror** (see below).
    - `Rulesfile` CRs — the official `falcosecurity/rules/falco-rules` OCI
      bundle, plus a small set of custom detection rules
      (`rulesfile-custom.yaml`, ported from the old setup, `capture:`
      dropped) at higher priority so they aren't shadowed by overlapping
      bundled rules.
    - `Plugin` CR — the `container` plugin, required for `%container.*`/
-     `%k8s.*` fields used in rule outputs.
+     `%k8s.*` fields used in rule outputs. Also pulled from the private
+     registry mirror.
    - `Config` CR — `json_output: true`, `stdout_output` only (no
      `http_output`/webhook by default — nothing is silently sent off-cluster;
      ship the pod's stdout via your existing node log agent instead), and
@@ -98,6 +100,52 @@ kubectl get falco,rulesfiles,plugins,configs -n falco
 kubectl -n falco get pods -o wide
 kubectl -n falco logs -l app.kubernetes.io/name=falco -f | grep -i priority   # once pods are up
 ```
+
+## Private registry image pulls
+
+`security/falco/falco.yaml` and `security/falco/plugin-container.yaml` pull
+from `registry.example.com` — swap that placeholder for your actual private
+registry host (and adjust the repository paths if they don't mirror
+upstream's `falcosecurity/...` layout 1:1). Two *different* kinds of
+credentials are needed, because the two pulls happen through different
+mechanisms:
+
+1. **The Falco image itself** (`falco.yaml`'s `podTemplateSpec`) is pulled
+   directly by the kubelet on every node, like any pod image — standard
+   `imagePullSecrets`, referencing a `kubernetes.io/dockerconfigjson`
+   Secret in the `falco` namespace:
+
+   ```bash
+   kubectl create secret docker-registry falco-image-pull-secret \
+     -n falco \
+     --docker-server=registry.example.com \
+     --docker-username=<user> \
+     --docker-password=<token>
+   ```
+
+2. **The `container` Plugin OCI artifact** is *not* pulled node-side —
+   falco-operator's instance-level aggregator (running in the
+   `falco-operator` Deployment) fetches it centrally and serves it to each
+   Falco pod's artifact-operator sidecar over the in-cluster artifact-cache
+   server (see the `NetworkPolicy` comment above). It authenticates via the
+   `Plugin` CR's own `registry.auth.secretRef`, which — per
+   falco-operator's `api/common/v1alpha1` `SecretRef` type — expects a
+   plain Secret with `username`/`password` keys, **not** a
+   `dockerconfigjson`:
+
+   ```bash
+   kubectl create secret generic falco-registry-credentials \
+     -n falco \
+     --from-literal=username=<user> \
+     --from-literal=password=<token>
+   ```
+
+Neither is committed to this repo (Flux never sees the values). Create them
+out-of-band per cluster as above, or manage them through Flux with
+[SOPS](https://fluxcd.io/flux/guides/mozilla-sops/) or
+[external-secrets](https://external-secrets.io/) if you want the Secret
+*objects* (not their plaintext) tracked in git too — neither is wired up
+here.
 
 ## Known gaps / next steps (not built here — scope was deliberately kept to core Falco)
 

@@ -26,8 +26,19 @@ spec:
           effect: NoSchedule
         - key: node-role.kubernetes.io/master
           effect: NoSchedule
+      # Pulls the falco image from a private registry instead of the
+      # operator's own upstream default. Tag pinned to 0.44.1 to match what
+      # this falco-operator version (0.4.x appVersion) defaults to anyway
+      # -- see docs/version-matrix.md in the falco-operator repo -- so this
+      # is a registry swap, not a version change. Requires a
+      # kubernetes.io/dockerconfigjson Secret named
+      # `falco-image-pull-secret` in this namespace; see k8s/README.md for
+      # how to create it (not committed to git).
+      imagePullSecrets:
+        - name: falco-image-pull-secret
       containers:
         - name: falco
+          image: registry.example.com/falcosecurity/falco:0.44.1
           tty: true
           resources:
             requests:
