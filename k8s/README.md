@@ -16,16 +16,19 @@ replacement; see the comment in `security/falco/rulesfile-custom.yaml`.
 It's back, as `security/sysdig-capture/`, because it covers a case Falco's
 own rule-triggered `capture:` genuinely doesn't: an unconditional rolling
 buffer (one `.scap` file per node per minute, always, not just around a
-rule match) to go back to for something no rule caught. The two problems
-cited above are addressed differently this time rather than re-created:
-hostPath coordination/locking is replaced by a single ReadWriteMany PVC
-with each node confined to its own subdirectory (no shared mutable file to
-coordinate over), and the privileged DaemonSet requirement is unavoidable
-for raw syscall capture but reuses the `falco` namespace's existing PSA
-exception rather than adding a new one. See
-`security/sysdig-capture/daemonset.yaml` and `persistentvolumeclaim.yaml`
-for the full reasoning, including the ReadWriteMany StorageClass
-prerequisite this needs that isn't universal across clusters.
+rule match) to go back to for something no rule caught. It does use
+hostPath again — the same mechanism the earlier removal cited — but the
+"no locking" half of that complaint never actually depended on hostPath
+vs. a PersistentVolume either way: each node's pod only ever touches its
+own directory, so there was never a file two pods could contend over
+regardless of backend. hostPath is the right call specifically *because*
+this is a short (10-minute) rolling buffer, not data meant to survive its
+node being replaced — a PVC's extra moving parts (a ReadWriteMany
+StorageClass prerequisite, network storage cost/latency) would buy
+nothing here. The privileged DaemonSet requirement is separately
+unavoidable for raw syscall capture, and reuses the `falco` namespace's
+existing PSA exception rather than adding a new one. See
+`security/sysdig-capture/daemonset.yaml` for the full reasoning.
 
 ## Layout
 
@@ -110,15 +113,12 @@ further `kubectl apply` needed.
    under the same `security` Flux Kustomization, but it doesn't actually
    need the operator to be up first):
    - `DaemonSet` (`daemonset.yaml`) — one `sysdig` container per node,
-     rotating a new `.scap` file every 60 seconds into a per-node
-     subdirectory, plus a small non-privileged sidecar deleting files older
-     than `RETENTION_MINUTES` (default 2 days).
-   - `PersistentVolumeClaim` (`persistentvolumeclaim.yaml`) — a single
-     ReadWriteMany-backed PVC shared by every node's pod. **Requires your
-     cluster to have a ReadWriteMany-capable StorageClass** (NFS/EFS/Azure
-     Files/Filestore/CephFS) — there's no working default, same as the
-     registry placeholder below; see the file's comment for what to set and
-     the hostPath fallback if you don't have one.
+     rotating a new `.scap` file every 60 seconds into a node-local
+     hostPath directory (`/var/lib/sysdig-captures` on the host), plus a
+     small non-privileged sidecar deleting files older than
+     `RETENTION_MINUTES` (default 10 — a short rolling buffer, not
+     long-term storage). No PersistentVolume: this data is deliberately
+     node-local and short-lived, so it doesn't need to survive the node.
 
 ## Verify
 
@@ -129,7 +129,7 @@ kubectl get falco,rulesfiles,plugins,configs -n falco
 kubectl -n falco get pods -o wide
 kubectl -n falco logs -l app.kubernetes.io/name=falco -f | grep -i priority   # once pods are up
 kubectl -n falco get pods -l app.kubernetes.io/name=sysdig-capture -o wide
-kubectl -n falco exec -c sysdig ds/sysdig-capture -- sh -c 'ls -la /data/$NODE_NAME | tail'
+kubectl -n falco exec -c sysdig ds/sysdig-capture -- sh -c 'ls -la /data | tail'
 ```
 
 ## Private registry image pulls
@@ -299,10 +299,6 @@ kubectl -n falco get plugin container -o jsonpath='{.status.conditions}'
   image is an unfilled `REPLACE_WITH_PINNED_TAG` placeholder for the same
   reason — verify against your nodes' actual kernel version before picking
   one, not just the newest tag.
-- **`sysdig-capture`'s ReadWriteMany StorageClass**: `REPLACE_WITH_RWX_STORAGECLASS`
-  in `security/sysdig-capture/persistentvolumeclaim.yaml` is an unfilled
-  placeholder — this DaemonSet won't schedule successfully until it's set
-  to a StorageClass your cluster actually has.
 - **k8s-metacollector / richer `%k8s.*` enrichment**: not deployed — the
   `container` plugin alone covers what the current custom rules and the
   bundled rules commonly need. Add the `k8smeta` `Plugin` CR +

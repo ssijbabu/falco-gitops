@@ -10,17 +10,19 @@
 # This DaemonSet is what k8s/README.md describes as "deliberately dropped"
 # from the previous setup -- it's back because that specific capability
 # (unconditional rolling capture) has no equivalent in the Falco Operator
-# model, only its two cited problems are addressed differently this time:
-#   - "hostPath coordination, no locking" -> a single ReadWriteMany PVC
-#     (persistentvolumeclaim.yaml) with each pod confined to its own
-#     $(NODE_NAME)/ subdirectory, so there's no file any two pods could
-#     ever contend over.
-#   - "privileged DaemonSet" -> inherent to raw syscall capture via
-#     sysdig's kernel module/eBPF driver, not something this manifest set
-#     can avoid; the `falco` namespace already carries the
-#     `pod-security.kubernetes.io/enforce: privileged` PSA label for
-#     exactly this reason (see namespace.yaml), so no new PSA exception is
-#     needed by reusing it here.
+# model. Storage is node-local (hostPath), not a PersistentVolume: this is
+# a short (10-minute) rolling buffer, not data meant to outlive the node or
+# be queried centrally, so a PVC's extra moving parts (RWX StorageClass
+# prerequisite, network storage latency/cost) buy nothing here. The
+# "no locking" concern that applied to the old setup doesn't apply to this
+# one regardless of PVC-vs-hostPath: each node's pod only ever touches its
+# own host directory, so there was never a file two pods could contend
+# over in the first place. "privileged DaemonSet" is inherent to raw
+# syscall capture via sysdig's kernel module/eBPF driver, not something
+# this manifest set can avoid; the `falco` namespace already carries the
+# `pod-security.kubernetes.io/enforce: privileged` PSA label for exactly
+# this reason (see namespace.yaml), so no new PSA exception is needed by
+# reusing it here.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -81,11 +83,9 @@ spec:
             - -c
             - |
               set -eu
-              mkdir -p "/data/${NODE_NAME}"
-              exec sysdig -z -C 500 -G 60 -w "/data/${NODE_NAME}/sysdig_%Y%m%d_%H%M%S.scap"
+              exec sysdig -z -C 500 -G 60 -w "/data/sysdig_%Y%m%d_%H%M%S.scap"
               # -z:  compress (zlib) -- meaningfully smaller files at the
-              #      cost of some CPU; matters a lot over a day of 1440
-              #      files/node.
+              #      cost of some CPU; matters over a day of 1440 files/node.
               # -G 60: rotate to a new file every 60 seconds -- this is the
               #      "every minute" requirement. Rotation is measured from
               #      capture start, not aligned to wall-clock :00 seconds.
@@ -100,11 +100,11 @@ spec:
               #      forensically complete but produces bigger files. Add
               #      `-s <len>` here to cap per-event buffer size if files
               #      are too large for your retention window.
-          env:
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
+              # No $(NODE_NAME) subdirectory: /data is already this node's
+              #      own hostPath volume (see the volumes: block below), so
+              #      there's nothing to disambiguate -- unlike the earlier
+              #      shared-PVC design, no other node's pod ever sees this
+              #      directory.
           resources:
             # Capturing every syscall on a busy node is genuinely CPU-
             # and I/O-intensive -- these are starting points, not tuned
@@ -162,22 +162,22 @@ spec:
             - |
               set -eu
               while true; do
-                find "/data/${NODE_NAME}" -name '*.scap*' -mmin "+${RETENTION_MINUTES}" -delete
-                sleep 300
+                find /data -name '*.scap*' -mmin "+${RETENTION_MINUTES}" -delete
+                sleep 60
               done
           env:
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
             - name: RETENTION_MINUTES
-              # 2 days. capture rotates every minute with no built-in
-              # expiry (deliberately not using sysdig's own -W flag here:
-              # combined with -G it STOPS capturing entirely once the file
-              # count limit is reached, rather than overwriting -- exactly
-              # the opposite of what a continuous rolling buffer needs),
-              # so without this loop the PVC fills up indefinitely.
-              value: "2880"
+              # Keep only the last 10 minutes of files. Capture rotates
+              # every minute with no built-in expiry (deliberately not
+              # using sysdig's own -W flag here: combined with -G it STOPS
+              # capturing entirely once the file count limit is reached,
+              # rather than overwriting -- exactly the opposite of what a
+              # continuous rolling buffer needs), so without this loop
+              # each node's disk fills up indefinitely. Polling every 60s
+              # (not e.g. 300s) keeps actual overshoot past the 10-minute
+              # target small -- at a coarser poll interval, files could
+              # linger noticeably past what "last 10 min" implies.
+              value: "10"
           resources:
             requests:
               cpu: 10m
@@ -212,5 +212,6 @@ spec:
           hostPath:
             path: /etc
         - name: capture-data
-          persistentVolumeClaim:
-            claimName: sysdig-capture-data
+          hostPath:
+            path: /var/lib/sysdig-captures
+            type: DirectoryOrCreate
