@@ -1,0 +1,216 @@
+---
+# Continuous rolling syscall capture, one .scap file per node per minute,
+# independent of any Falco rule match -- this is deliberately NOT the same
+# thing as Falco's own rule-triggered `capture:` block (see
+# security/falco/rulesfile-custom.yaml's comment): that only captures
+# around a rule match, this captures unconditionally, on a fixed clock, as
+# a rolling forensic buffer you can go back to even for something no rule
+# caught.
+#
+# This DaemonSet is what k8s/README.md describes as "deliberately dropped"
+# from the previous setup -- it's back because that specific capability
+# (unconditional rolling capture) has no equivalent in the Falco Operator
+# model, only its two cited problems are addressed differently this time:
+#   - "hostPath coordination, no locking" -> a single ReadWriteMany PVC
+#     (persistentvolumeclaim.yaml) with each pod confined to its own
+#     $(NODE_NAME)/ subdirectory, so there's no file any two pods could
+#     ever contend over.
+#   - "privileged DaemonSet" -> inherent to raw syscall capture via
+#     sysdig's kernel module/eBPF driver, not something this manifest set
+#     can avoid; the `falco` namespace already carries the
+#     `pod-security.kubernetes.io/enforce: privileged` PSA label for
+#     exactly this reason (see namespace.yaml), so no new PSA exception is
+#     needed by reusing it here.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sysdig-capture
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: sysdig-capture
+    app.kubernetes.io/part-of: falco-security-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sysdig-capture
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sysdig-capture
+        app.kubernetes.io/part-of: falco-security-stack
+    spec:
+      # No Kubernetes API access needed at all -- sysdig captures node-local
+      # syscalls, it never calls the API server.
+      automountServiceAccountToken: false
+      # Reuses Falco's own PriorityClass: this is the same class of
+      # security-critical, keep-it-running-under-node-pressure DaemonSet.
+      priorityClassName: falco-security-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          effect: NoSchedule
+      # Sees host processes/PIDs, required for syscall capture to resolve
+      # to real host-level process identities rather than this pod's own
+      # (empty) PID namespace.
+      hostPID: true
+      containers:
+        - name: sysdig
+          # Pin an actual release tag before applying this -- "latest" on a
+          # kernel-driver-loading image is a real risk (a driver build that
+          # worked yesterday can fail against a newer kernel the image
+          # wasn't built/tested against). Verify against your nodes' kernel
+          # version and sysdig's supported-kernels list first.
+          image: docker.io/sysdig/sysdig:REPLACE_WITH_PINNED_TAG
+          # `command` (Kubernetes) maps to Docker ENTRYPOINT and would
+          # REPLACE the image's own entrypoint (docker-entrypoint.sh, which
+          # symlinks kernel headers from the host and runs
+          # scap-driver-loader to build/load the capture driver) --
+          # deliberately using `args` instead (maps to CMD, passed through
+          # to the image's entrypoint's own `exec "$@"`), so driver setup
+          # still runs first. Setting `command` here would silently skip
+          # driver loading and capture would never start.
+          args:
+            - sh
+            - -c
+            - |
+              set -eu
+              mkdir -p "/data/${NODE_NAME}"
+              exec sysdig -z -C 500 -G 60 -w "/data/${NODE_NAME}/sysdig_%Y%m%d_%H%M%S.scap"
+              # -z:  compress (zlib) -- meaningfully smaller files at the
+              #      cost of some CPU; matters a lot over a day of 1440
+              #      files/node.
+              # -G 60: rotate to a new file every 60 seconds -- this is the
+              #      "every minute" requirement. Rotation is measured from
+              #      capture start, not aligned to wall-clock :00 seconds.
+              # -C 500: extra safety net independent of -G: also force a
+              #      new file if the current one exceeds 500 x 10^6 bytes
+              #      within its minute, so one unusually chatty minute on a
+              #      busy node can't produce one huge file or stall
+              #      rotation. Units are 10^6 bytes, not MiB, per sysdig's
+              #      own docs.
+              # No -s/--snaplen override: default captures full data
+              #      buffers (e.g. file read/write payloads), which is more
+              #      forensically complete but produces bigger files. Add
+              #      `-s <len>` here to cap per-event buffer size if files
+              #      are too large for your retention window.
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            # Capturing every syscall on a busy node is genuinely CPU-
+            # and I/O-intensive -- these are starting points, not tuned
+            # numbers; watch actual usage and adjust per node profile.
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          securityContext:
+            # Matches the image's own documented `docker run --privileged`
+            # requirement (docker/sysdig/Dockerfile's LABEL usage string in
+            # the sysdig source tree) -- scap-driver-loader needs to build
+            # and insert a kernel module (or load the eBPF probe) and open
+            # the resulting device nodes, which needs more than any single
+            # named Linux capability covers. A trimmed capability set may
+            # be possible with the eBPF driver on some kernels, but that's
+            # not verified here -- narrow this only after confirming
+            # capture still works on your actual nodes.
+            privileged: true
+          volumeMounts:
+            # Host mount layout matches docker/sysdig/Dockerfile's LABEL
+            # usage string exactly (the image's own documented contract),
+            # not guessed.
+            - name: host-dev
+              mountPath: /host/dev
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: host-boot
+              mountPath: /host/boot
+              readOnly: true
+            - name: host-lib-modules
+              mountPath: /host/lib/modules
+              readOnly: true
+            - name: host-usr
+              mountPath: /host/usr
+              readOnly: true
+            - name: host-etc
+              mountPath: /host/etc
+              readOnly: true
+            - name: capture-data
+              mountPath: /data
+        - name: capture-cleanup
+          # Separate lightweight, non-privileged container for retention --
+          # deliberately not folded into the sysdig container's own command,
+          # so a cleanup bug can't affect (or be affected by) capture
+          # itself, and so this container's resource/security profile can
+          # stay minimal independent of sysdig's own privileged one.
+          image: docker.io/library/busybox:1.36
+          args:
+            - sh
+            - -c
+            - |
+              set -eu
+              while true; do
+                find "/data/${NODE_NAME}" -name '*.scap*' -mmin "+${RETENTION_MINUTES}" -delete
+                sleep 300
+              done
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RETENTION_MINUTES
+              # 2 days. capture rotates every minute with no built-in
+              # expiry (deliberately not using sysdig's own -W flag here:
+              # combined with -G it STOPS capturing entirely once the file
+              # count limit is reached, rather than overwriting -- exactly
+              # the opposite of what a continuous rolling buffer needs),
+              # so without this loop the PVC fills up indefinitely.
+              value: "2880"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: capture-data
+              mountPath: /data
+      volumes:
+        - name: host-dev
+          hostPath:
+            path: /dev
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: host-boot
+          hostPath:
+            path: /boot
+        - name: host-lib-modules
+          hostPath:
+            path: /lib/modules
+        - name: host-usr
+          hostPath:
+            path: /usr
+        - name: host-etc
+          hostPath:
+            path: /etc
+        - name: capture-data
+          persistentVolumeClaim:
+            claimName: sysdig-capture-data

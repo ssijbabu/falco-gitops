@@ -7,11 +7,25 @@ Falco DaemonSet, rules, plugin, and config.
 
 This replaces a previous hand-written kustomize setup (Falco + a custom
 sysdig pre-trigger capture sidecar, applied with `kubectl apply -k`). That
-sysdig capture pipeline was deliberately dropped in this rewrite — it's not
-part of the Falco Operator's model and added meaningful operational
-complexity (privileged DaemonSet, hostPath coordination, no locking). Native
-Falco forward-capture (`capture: true` per rule) is still available if
-wanted later; see the comment in `security/falco/rulesfile-custom.yaml`.
+sysdig capture pipeline was dropped in the initial rewrite — it wasn't part
+of the Falco Operator's model and added meaningful operational complexity
+(privileged DaemonSet, hostPath coordination, no locking) — with native
+Falco forward-capture (`capture: true` per rule) offered as the in-model
+replacement; see the comment in `security/falco/rulesfile-custom.yaml`.
+
+It's back, as `security/sysdig-capture/`, because it covers a case Falco's
+own rule-triggered `capture:` genuinely doesn't: an unconditional rolling
+buffer (one `.scap` file per node per minute, always, not just around a
+rule match) to go back to for something no rule caught. The two problems
+cited above are addressed differently this time rather than re-created:
+hostPath coordination/locking is replaced by a single ReadWriteMany PVC
+with each node confined to its own subdirectory (no shared mutable file to
+coordinate over), and the privileged DaemonSet requirement is unavoidable
+for raw syscall capture but reuses the `falco` namespace's existing PSA
+exception rather than adding a new one. See
+`security/sysdig-capture/daemonset.yaml` and `persistentvolumeclaim.yaml`
+for the full reasoning, including the ReadWriteMany StorageClass
+prerequisite this needs that isn't universal across clusters.
 
 ## Layout
 
@@ -25,7 +39,8 @@ k8s/
 │   ├── sources/                 # HelmRepository: falcosecurity charts
 │   └── falco-operator/          # Namespace + HelmRelease for the operator itself
 └── security/
-    └── falco/                   # Falco instance + rules + plugin + config, via the operator's CRDs
+    ├── falco/                   # Falco instance + rules + plugin + config, via the operator's CRDs
+    └── sysdig-capture/          # Unconditional rolling .scap capture DaemonSet, hand-written (not operator-managed)
 ```
 
 `clusters/<name>/` is the unit that scales to more clusters (`clusters/staging/`,
@@ -90,6 +105,20 @@ further `kubectl apply` needed.
      Admission level — required because falco-operator runs the Falco
      container `privileged: true` by default; see the comment in
      `namespace.yaml`).
+3. **`security/sysdig-capture/`**, independent of the operator (hand-written,
+   not a CR — `dependsOn: [infrastructure]` still applies since it lives
+   under the same `security` Flux Kustomization, but it doesn't actually
+   need the operator to be up first):
+   - `DaemonSet` (`daemonset.yaml`) — one `sysdig` container per node,
+     rotating a new `.scap` file every 60 seconds into a per-node
+     subdirectory, plus a small non-privileged sidecar deleting files older
+     than `RETENTION_MINUTES` (default 2 days).
+   - `PersistentVolumeClaim` (`persistentvolumeclaim.yaml`) — a single
+     ReadWriteMany-backed PVC shared by every node's pod. **Requires your
+     cluster to have a ReadWriteMany-capable StorageClass** (NFS/EFS/Azure
+     Files/Filestore/CephFS) — there's no working default, same as the
+     registry placeholder below; see the file's comment for what to set and
+     the hostPath fallback if you don't have one.
 
 ## Verify
 
@@ -99,6 +128,8 @@ flux get helmreleases -n falco-operator
 kubectl get falco,rulesfiles,plugins,configs -n falco
 kubectl -n falco get pods -o wide
 kubectl -n falco logs -l app.kubernetes.io/name=falco -f | grep -i priority   # once pods are up
+kubectl -n falco get pods -l app.kubernetes.io/name=sysdig-capture -o wide
+kubectl -n falco exec -c sysdig ds/sysdig-capture -- sh -c 'ls -la /data/$NODE_NAME | tail'
 ```
 
 ## Private registry image pulls
@@ -156,6 +187,13 @@ Neither of the two credentials above is committed to this repo in plaintext.
 The image-pull Secret is created out-of-band per cluster (step 1); the
 Plugin auth Secret is either created out-of-band too, or kept live
 in-cluster by the CronJob below — never held in git either way.
+
+`security/sysdig-capture/daemonset.yaml` is separate from all of the above:
+it pulls `docker.io/sysdig/sysdig` and `docker.io/library/busybox` directly
+from Docker Hub, unauthenticated, and isn't part of this private-registry
+swap. If your nodes have no public internet egress for image pulls, mirror
+those two images and update the DaemonSet's `image:` fields yourself —
+nothing here does that automatically.
 
 ## Managed identity for the Plugin OCI pull
 
@@ -257,7 +295,14 @@ kubectl -n falco get plugin container -o jsonpath='{.status.conditions}'
   (`0.3.1` at time of writing); the official-rules and `container` plugin
   OCI artifacts are still on `:latest` — re-verify and pin to a digest for
   real production use, same caveat the previous manifest set called out for
-  its own image tags.
+  its own image tags. `security/sysdig-capture/daemonset.yaml`'s sysdig
+  image is an unfilled `REPLACE_WITH_PINNED_TAG` placeholder for the same
+  reason — verify against your nodes' actual kernel version before picking
+  one, not just the newest tag.
+- **`sysdig-capture`'s ReadWriteMany StorageClass**: `REPLACE_WITH_RWX_STORAGECLASS`
+  in `security/sysdig-capture/persistentvolumeclaim.yaml` is an unfilled
+  placeholder — this DaemonSet won't schedule successfully until it's set
+  to a StorageClass your cluster actually has.
 - **k8s-metacollector / richer `%k8s.*` enrichment**: not deployed — the
   `container` plugin alone covers what the current custom rules and the
   bundled rules commonly need. Add the `k8smeta` `Plugin` CR +
