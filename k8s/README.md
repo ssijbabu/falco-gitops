@@ -299,6 +299,13 @@ kubectl -n falco get plugin container -o jsonpath='{.status.conditions}'
   image is an unfilled `REPLACE_WITH_PINNED_TAG` placeholder for the same
   reason — verify against your nodes' actual kernel version before picking
   one, not just the newest tag.
+- **`sysdig-capture` doesn't currently work on AKS at all**: verified
+  against three node OS/kernel combinations (default Ubuntu 24.04, Ubuntu
+  22.04, Azure Linux 3.0) — the published `sysdig/sysdig:0.41.4` image
+  can't load its capture driver on any of them, for three different
+  reasons that all trace back to the same root cause. Full writeup,
+  including the fix that doesn't work and the one that would:
+  `security/sysdig-capture/DRIVER-COMPATIBILITY.md`.
 - **k8s-metacollector / richer `%k8s.*` enrichment**: not deployed — the
   `container` plugin alone covers what the current custom rules and the
   bundled rules commonly need. Add the `k8smeta` `Plugin` CR +
