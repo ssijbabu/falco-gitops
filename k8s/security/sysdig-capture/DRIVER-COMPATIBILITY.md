@@ -1,35 +1,98 @@
 # `sysdig-capture` driver compatibility: findings and root cause
 
-**Status: blocked.** `docker.io/sysdig/sysdig:0.41.4` cannot load its kernel
-capture driver (kernel module or eBPF probe) on any of the three AKS node
-OS/kernel combinations tested. This is a structural limitation of the
-published image, not something fixable via node selection, `nodeSelector`,
-or pod-spec tuning. Kept here as the record of what was tried and why, so
-the next person (or the next AI session) doesn't repeat the same three
-attempts before finding this.
+**Status: working, via `--modern-bpf`.** `docker.io/sysdig/sysdig:0.41.4`
+captures fine on AKS when started with `sysdig --modern-bpf` and with the
+image's entrypoint bypassed. Verified live on an AKS Azure Linux 3.0 node
+(kernel `6.6.150.1-1.azl3`, the same kernel as attempt 3 below), with no
+kernel headers, no driver build, and no `privileged: true`.
+
+The three attempts recorded further down all failed, and their diagnoses
+(GCC flags, glibc/modpost, missing headers) are correct. But every one of
+them used the kernel-module or *legacy* eBPF driver. None used the modern
+eBPF engine. This file's first version concluded that the
+`sysdig` CLI has no CO-RE/BTF support. That was wrong, and it's kept here
+so nobody repeats it.
 
 ## TL;DR
 
-- `sysdig`'s driver loader (`scap-driver-loader`) tries, in order: download a
-  prebuilt driver for the exact running kernel release → compile one
-  locally against the host's kernel headers. Both paths failed on all
-  three node OS options AKS currently offers.
-- No prebuilt driver/eBPF probe exists for *any* of the three exact kernel
-  releases tested — expected, since AKS patches kernels far more often
-  than `sysdig`'s driver-build catalog is updated.
-- Local compilation fails for a **different reason on each OS**, but the
-  common thread is the same: `sysdig/sysdig:0.41.4`'s base image
-  (`registry.access.redhat.com/ubi8/ubi`, i.e. RHEL 8) has an old
-  toolchain (GCC 8.5.0, glibc ~2.28) that can't build against modern,
-  actively-patched kernels' own build requirements.
-- This CLI (`draios/sysdig`) has **no CO-RE/BTF/libbpf support** — it only
-  supports the legacy "compile an object file matching this exact kernel"
-  model. Falco's own `modern_ebpf` driver (from the actively-maintained
-  `falcosecurity/libs`, already the default in `security/falco/falco.yaml`)
-  is CO-RE-based and doesn't have this problem — see "What would actually
-  fix this" below.
+- sysdig has **three** Linux capture engines, not two:
 
-## Test environment
+  | Selected by | Engine | Needs |
+  |---|---|---|
+  | *(default)* | kernel module (`/dev/scap0`) | exact-kernel `.ko`, prebuilt or compiled against host headers |
+  | `SYSDIG_BPF_PROBE` / `--bpf` | legacy eBPF | exact-kernel `.o`, prebuilt or compiled against host headers |
+  | `--modern-bpf` | modern eBPF (CO-RE) | kernel BTF (`/sys/kernel/btf/vmlinux`) only |
+
+- `--modern-bpf` is compiled into the shipped 0.41.4 binary
+  (`BUILD_SYSDIG_MODERN_BPF` is on by default in `CMakeLists.txt`; the
+  flag appears in the image's `sysdig --help`). It calls
+  `inspector->open_modern_bpf()` (`userspace/sysdig/utils/sinsp_opener.cpp`).
+  This is the same `falcosecurity/libs` (0.21.0) engine that Falco's
+  `modern_ebpf` driver uses.
+- `SYSDIG_BPF_PROBE` (attempt 1) selects the **legacy** probe
+  (`open_bpf(probe)`), so it hit the same compile path as the kernel module.
+- The image's `docker-entrypoint.sh` always runs `scap-driver-loader`
+  (download or compile a kmod/legacy probe) before `exec "$@"`. Its failure
+  isn't fatal (`set -e` is commented out), but it's pointless for modern eBPF
+  and floods the logs with misleading build errors. The DaemonSet now sets
+  `command: ["/usr/bin/sysdig"]` to skip it.
+
+## Live verification (AKS, Azure Linux 3.0)
+
+Disposable cluster, `eastus`, one `Standard_D2s_v3` node, `--os-sku
+AzureLinux`. The node reported `Microsoft Azure Linux 3.0`,
+`6.6.150.1-1.azl3`, `containerd://2.2.4`.
+
+- `/sys/kernel/btf/vmlinux` present; `/lib/modules/6.6.150.1-1.azl3/build`
+  absent. Neither fact matters to modern eBPF.
+- `sysdig --modern-bpf -M 30 -w /data/test.scap` exited 0 with an 86 MB
+  file and 1,147,361 events. `sysdig -r` read back host `execve`s, file
+  writes and scheduler switches.
+- **Reduced capabilities work:** `privileged: false`, `drop: [ALL]`,
+  `add: [BPF, PERFMON, SYS_RESOURCE, SYS_PTRACE]`,
+  `allowPrivilegeEscalation: false`. That captured about 1M events in 15 s. The
+  exact `daemonset.yaml` in this directory was deployed with these settings.
+- **`-G 60 -W 10` is a real ring buffer.** It ran 12+ minutes, holding
+  exactly 10 files with the oldest one advancing each minute, 0 restarts,
+  and a flat ~135 MB on disk (this idle node). With `-G`, libsinsp's
+  `sinsp_cycledumper.cpp` removes the oldest file on each rotation.
+  `sysdig --help` still says `-G` + `-W` "exits when reaching the limit".
+  That text is stale; the process keeps running.
+- **…but the ring doesn't survive restarts.** sysdig keeps the list of files
+  to delete only in memory. After replacing the pod, all 10 files from the
+  previous pod stayed in the hostPath untouched, next to the new pod's
+  files. The `capture-cleanup` sidecar (`RETENTION_MINUTES=12`, so it never
+  races the live ring) handles those orphans. It was verified removing them
+  with all capabilities dropped.
+
+## Other corrections to the first version
+
+- **Default snaplen is 80 bytes, not full buffers** (`-s` in `sysdig
+  --help`). Only the first 80 bytes of each read/write/send/recv payload
+  are recorded unless `-s` is raised.
+- **Host mounts:** `/host/dev`, `/host/boot`, `/host/lib/modules` and
+  `/host/usr` were only needed by `scap-driver-loader` and have been
+  dropped. `/host/proc` stays (the image sets `HOST_ROOT=/host`), as does
+  `hostPID`.
+
+## Requirements going forward
+
+- The node kernel must expose BTF (`/sys/kernel/btf/vmlinux`). Azure Linux 3
+  does; the Ubuntu 22.04/24.04 AKS kernels should too (their
+  `CONFIG_DEBUG_INFO_BTF` is on), but those two weren't re-tested with
+  `--modern-bpf`.
+- Container metadata enrichment (`container.id`, image names) wasn't
+  evaluated. Raw capture doesn't need it; mounting
+  `/run/containerd/containerd.sock` is the thing to try if you want it.
+
+---
+
+# Historical record: the three failed attempts
+
+Everything below is the original investigation, unchanged. Each failure is
+real, but it applies only to the kernel-module and legacy-eBPF engines.
+
+## Original test environment
 
 Disposable AKS cluster (`sysdig-capture-aks`, `eastus`, `Standard_D2s_v3`),
 one node pool per OS/kernel combination tested, `falco` namespace, the
@@ -131,41 +194,3 @@ at all (no `/lib/modules/<release>/build` symlink, unlike Ubuntu, which
 does). There's nothing to compile against regardless of toolchain —
 installing kernel-devel packages on the host isn't something this
 DaemonSet can do (out of scope: modifying node OS packages from a pod).
-
-## Why this isn't a node-selection problem
-
-Three different OS families, three different kernel series (6.8.x, 5.15.x,
-6.6.x), three different failure *mechanisms* (compiler-flag mismatch,
-glibc ABI mismatch, missing host headers entirely) — all downstream of the
-same root cause: `sysdig/sysdig:0.41.4`'s RHEL-8-based image trying to
-build kernel-matched artifacts against hosts whose own toolchains and
-packaging have moved well past what that base image ships. No AKS node OS
-option currently available sidesteps this.
-
-## What would actually fix this
-
-1. **A custom `sysdig` image on a modern base** (current-generation
-   Ubuntu/Debian, matching glibc/GCC to what current kernels actually
-   need) would likely clear all three failures above. It would *not* fix
-   the underlying fragility, though: this tool's driver model requires an
-   exact kernel-release match (prebuilt or freshly compiled) with no
-   portability layer, so it would need re-verifying against every AKS node
-   image update going forward — a real ongoing maintenance cost.
-2. **Use a CO-RE (Compile Once – Run Everywhere) driver instead.**
-   `falcosecurity/libs`' `modern_ebpf` driver — the actively maintained
-   project, and already the *default* Falco itself uses in this repo's own
-   `security/falco/falco.yaml` — resolves kernel struct layouts at load
-   time via BTF, not at build time via local compilation against exact
-   headers. It doesn't have any of the three failure modes above, and
-   doesn't need re-verifying on every kernel patch. If the underlying goal
-   (an always-on rolling capture buffer, not just rule-triggered) is still
-   wanted, this is the direction to build it in, not a patch on top of the
-   legacy `sysdig` CLI.
-
-## What still works
-
-Falco's own rule-triggered `capture:` feature (`security/falco/falco.yaml`
-+ a rule's `capture: true`) uses the `modern_ebpf` driver already, via the
-same falco-operator-managed Falco DaemonSet this repo deploys for
-detection. It doesn't share any of `sysdig-capture`'s problems. See
-`k8s/README.md` for how that's verified live.
