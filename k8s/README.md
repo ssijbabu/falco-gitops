@@ -25,9 +25,10 @@ regardless of backend. hostPath is the right call specifically *because*
 this is a short (10-minute) rolling buffer, not data meant to survive its
 node being replaced — a PVC's extra moving parts (a ReadWriteMany
 StorageClass prerequisite, network storage cost/latency) would buy
-nothing here. The privileged DaemonSet requirement is separately
-unavoidable for raw syscall capture, and reuses the `falco` namespace's
-existing PSA exception rather than adding a new one. See
+nothing here. Capture uses sysdig's modern eBPF (CO-RE) engine, so the pod
+isn't `privileged` — just `BPF`/`PERFMON`/`SYS_RESOURCE`/`SYS_PTRACE` plus
+`hostPID` — but that still exceeds PSA "baseline", so it reuses the `falco`
+namespace's existing PSA exception rather than adding a new one. See
 `security/sysdig-capture/daemonset.yaml` for the full reasoning.
 
 ## Layout
@@ -112,12 +113,13 @@ further `kubectl apply` needed.
    not a CR — `dependsOn: [infrastructure]` still applies since it lives
    under the same `security` Flux Kustomization, but it doesn't actually
    need the operator to be up first):
-   - `DaemonSet` (`daemonset.yaml`) — one `sysdig` container per node,
-     rotating a new `.scap` file every 60 seconds into a node-local
-     hostPath directory (`/var/lib/sysdig-captures` on the host), plus a
-     small non-privileged sidecar deleting files older than
-     `RETENTION_MINUTES` (default 10 — a short rolling buffer, not
-     long-term storage). No PersistentVolume: this data is deliberately
+   - `DaemonSet` (`daemonset.yaml`) — one `sysdig --modern-bpf` container
+     per node, rotating a new `.scap` file every 60 seconds into a
+     node-local hostPath directory (`/var/lib/sysdig-captures` on the
+     host) and keeping the newest 10 (`-G 60 -W 10`), plus a small
+     non-privileged sidecar deleting files older than `RETENTION_MINUTES`
+     (default 12) — a safety net for files left behind by a previous pod,
+     which sysdig's in-memory ring doesn't track. No PersistentVolume: this data is deliberately
      node-local and short-lived, so it doesn't need to survive the node.
 
 ## Verify
@@ -296,16 +298,14 @@ kubectl -n falco get plugin container -o jsonpath='{.status.conditions}'
   OCI artifacts are still on `:latest` — re-verify and pin to a digest for
   real production use, same caveat the previous manifest set called out for
   its own image tags. `security/sysdig-capture/daemonset.yaml`'s sysdig
-  image is an unfilled `REPLACE_WITH_PINNED_TAG` placeholder for the same
-  reason — verify against your nodes' actual kernel version before picking
-  one, not just the newest tag.
-- **`sysdig-capture` doesn't currently work on AKS at all**: verified
-  against three node OS/kernel combinations (default Ubuntu 24.04, Ubuntu
-  22.04, Azure Linux 3.0) — the published `sysdig/sysdig:0.41.4` image
-  can't load its capture driver on any of them, for three different
-  reasons that all trace back to the same root cause. Full writeup,
-  including the fix that doesn't work and the one that would:
-  `security/sysdig-capture/DRIVER-COMPATIBILITY.md`.
+  image is pinned to `0.41.4` (the tag verified live on AKS); pin it to a
+  digest the same way.
+- **`sysdig-capture` needs a BTF-enabled kernel**: it uses sysdig's
+  `--modern-bpf` engine, which needs no kernel headers or driver build but
+  does need `/sys/kernel/btf/vmlinux` on the node. Verified live on AKS
+  Azure Linux 3.0 (kernel `6.6.150.1-1.azl3`). The kernel-module and
+  legacy-eBPF paths don't work on any AKS node OS — see
+  `security/sysdig-capture/DRIVER-COMPATIBILITY.md` for both halves.
 - **k8s-metacollector / richer `%k8s.*` enrichment**: not deployed — the
   `container` plugin alone covers what the current custom rules and the
   bundled rules commonly need. Add the `k8smeta` `Plugin` CR +
